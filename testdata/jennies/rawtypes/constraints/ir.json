@@ -1,0 +1,320 @@
+{
+  "Package": "constraints",
+  "Metadata": {},
+  "EntryPointType": {
+    "Kind": "",
+    "Nullable": false
+  },
+  "Objects": {
+    "SomeStruct": {
+      "Name": "SomeStruct",
+      "Type": {
+        "Kind": "struct",
+        "Nullable": false,
+        "Struct": {
+          "Fields": [
+            {
+              "Name": "id",
+              "Type": {
+                "Kind": "scalar",
+                "Nullable": false,
+                "Scalar": {
+                  "ScalarKind": "uint64",
+                  "Constraints": [
+                    {
+                      "Op": "\u003e=",
+                      "Args": [
+                        5
+                      ]
+                    },
+                    {
+                      "Op": "\u003c",
+                      "Args": [
+                        10
+                      ]
+                    }
+                  ]
+                }
+              },
+              "Required": true
+            },
+            {
+              "Name": "maybeId",
+              "Type": {
+                "Kind": "scalar",
+                "Nullable": false,
+                "Scalar": {
+                  "ScalarKind": "uint64",
+                  "Constraints": [
+                    {
+                      "Op": "\u003e=",
+                      "Args": [
+                        5
+                      ]
+                    },
+                    {
+                      "Op": "\u003c",
+                      "Args": [
+                        10
+                      ]
+                    }
+                  ]
+                }
+              },
+              "Required": false
+            },
+            {
+              "Name": "greaterThanZero",
+              "Type": {
+                "Kind": "scalar",
+                "Nullable": false,
+                "Scalar": {
+                  "ScalarKind": "uint64",
+                  "Constraints": [
+                    {
+                      "Op": "\u003c",
+                      "Args": [
+                        3
+                      ]
+                    }
+                  ]
+                }
+              },
+              "Required": true
+            },
+            {
+              "Name": "negative",
+              "Type": {
+                "Kind": "scalar",
+                "Nullable": false,
+                "Scalar": {
+                  "ScalarKind": "int64",
+                  "Constraints": [
+                    {
+                      "Op": "\u003e=",
+                      "Args": [
+                        -19
+                      ]
+                    },
+                    {
+                      "Op": "\u003c",
+                      "Args": [
+                        10
+                      ]
+                    }
+                  ]
+                }
+              },
+              "Required": true
+            },
+            {
+              "Name": "title",
+              "Type": {
+                "Kind": "scalar",
+                "Nullable": false,
+                "Scalar": {
+                  "ScalarKind": "string",
+                  "Constraints": [
+                    {
+                      "Op": "minLength",
+                      "Args": [
+                        1
+                      ]
+                    }
+                  ]
+                }
+              },
+              "Required": true
+            },
+            {
+              "Name": "labels",
+              "Type": {
+                "Kind": "map",
+                "Nullable": false,
+                "Map": {
+                  "IndexType": {
+                    "Kind": "scalar",
+                    "Nullable": false,
+                    "Scalar": {
+                      "ScalarKind": "string"
+                    }
+                  },
+                  "ValueType": {
+                    "Kind": "scalar",
+                    "Nullable": false,
+                    "Scalar": {
+                      "ScalarKind": "string",
+                      "Constraints": [
+                        {
+                          "Op": "minLength",
+                          "Args": [
+                            1
+                          ]
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "Required": true
+            },
+            {
+              "Name": "tags",
+              "Type": {
+                "Kind": "array",
+                "Nullable": false,
+                "Array": {
+                  "ValueType": {
+                    "Kind": "scalar",
+                    "Nullable": false,
+                    "Scalar": {
+                      "ScalarKind": "string",
+                      "Constraints": [
+                        {
+                          "Op": "minLength",
+                          "Args": [
+                            1
+                          ]
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "Required": true
+            },
+            {
+              "Name": "regex",
+              "Type": {
+                "Kind": "scalar",
+                "Nullable": false,
+                "Scalar": {
+                  "ScalarKind": "string",
+                  "Constraints": [
+                    {
+                      "Op": "=~",
+                      "Args": [
+                        "^[a-zA-Z0-9_-]+$"
+                      ]
+                    }
+                  ]
+                }
+              },
+              "Required": true
+            },
+            {
+              "Name": "negativeRegex",
+              "Type": {
+                "Kind": "scalar",
+                "Nullable": false,
+                "Scalar": {
+                  "ScalarKind": "string",
+                  "Constraints": [
+                    {
+                      "Op": "!~",
+                      "Args": [
+                        "^[a-zA-Z0-9_-]+$"
+                      ]
+                    }
+                  ]
+                }
+              },
+              "Required": true
+            },
+            {
+              "Name": "minMaxList",
+              "Type": {
+                "Kind": "array",
+                "Nullable": false,
+                "Array": {
+                  "ValueType": {
+                    "Kind": "scalar",
+                    "Nullable": false,
+                    "Scalar": {
+                      "ScalarKind": "string"
+                    }
+                  },
+                  "Constraints": [
+                    {
+                      "Op": "minItems",
+                      "Args": [
+                        1
+                      ]
+                    },
+                    {
+                      "Op": "maxItems",
+                      "Args": [
+                        64
+                      ]
+                    }
+                  ]
+                }
+              },
+              "Required": true
+            },
+            {
+              "Name": "uniqueList",
+              "Type": {
+                "Kind": "array",
+                "Nullable": false,
+                "Array": {
+                  "ValueType": {
+                    "Kind": "scalar",
+                    "Nullable": false,
+                    "Scalar": {
+                      "ScalarKind": "string"
+                    }
+                  },
+                  "Constraints": [
+                    {
+                      "Op": "uniqueItems"
+                    }
+                  ]
+                }
+              },
+              "Required": true
+            },
+            {
+              "Name": "fullConstraintList",
+              "Type": {
+                "Kind": "array",
+                "Nullable": false,
+                "Array": {
+                  "ValueType": {
+                    "Kind": "scalar",
+                    "Nullable": false,
+                    "Scalar": {
+                      "ScalarKind": "int64"
+                    }
+                  },
+                  "Constraints": [
+                    {
+                      "Op": "minItems",
+                      "Args": [
+                        2
+                      ]
+                    },
+                    {
+                      "Op": "maxItems",
+                      "Args": [
+                        10
+                      ]
+                    },
+                    {
+                      "Op": "uniqueItems"
+                    }
+                  ]
+                }
+              },
+              "Required": true
+            }
+          ]
+        }
+      },
+      "SelfRef": {
+        "ReferredPkg": "constraints",
+        "ReferredType": "SomeStruct"
+      }
+    }
+  }
+}

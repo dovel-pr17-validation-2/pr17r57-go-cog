@@ -1,0 +1,354 @@
+package codegen
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/goccy/go-yaml"
+	"github.com/grafana/cog/internal/jennies/golang"
+	"github.com/grafana/cog/internal/jennies/java"
+	"github.com/grafana/cog/internal/jennies/jsonschema"
+	"github.com/grafana/cog/internal/jennies/openapi"
+	"github.com/grafana/cog/internal/jennies/php"
+	"github.com/grafana/cog/internal/jennies/python"
+	"github.com/grafana/cog/internal/jennies/remote"
+	"github.com/grafana/cog/internal/jennies/terraform"
+	"github.com/grafana/cog/internal/jennies/typescript"
+	"github.com/grafana/cog/internal/tools"
+	"github.com/grafana/cog/internal/veneers/rewrite"
+	cogyaml "github.com/grafana/cog/internal/yaml"
+	"github.com/grafana/cog/pkg/ir"
+	"github.com/grafana/cog/pkg/ir/transforms"
+	"github.com/grafana/cog/pkg/languages"
+	"github.com/grafana/cog/pkg/logs"
+)
+
+type ParametersInterpolator func(input string) string
+
+type ProgressReporter func(msg string)
+
+type PipelineOption func(pipeline *Pipeline)
+
+func PipelineFromFile(file string, opts ...PipelineOption) (*Pipeline, error) {
+	var err error
+	if !filepath.IsAbs(file) {
+		file, err = filepath.Abs(file)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	fileHandle, err := os.Open(file)
+	if err != nil {
+		return nil, fmt.Errorf("could not open pipeline config: %w", err)
+	}
+	defer func() { _ = fileHandle.Close() }()
+
+	pipeline, err := NewPipeline()
+	if err != nil {
+		return nil, err
+	}
+
+	decoder := yaml.NewDecoder(fileHandle, yaml.DisallowUnknownField())
+	if err := decoder.Decode(pipeline); err != nil {
+		return nil, fmt.Errorf("could not parse pipeline config:\n%s", yaml.FormatError(err, true, true))
+	}
+
+	pipeline.Parameters["__config_dir"] = filepath.Dir(file)
+
+	pipeline.interpolator = createInterpolator(pipeline.Parameters)
+
+	for i, input := range pipeline.Inputs {
+		input.Source = &Source{
+			Path: file,
+			Ref:  fmt.Sprintf("$.inputs[%d]", i),
+		}
+	}
+
+	for _, opt := range opts {
+		opt(pipeline)
+	}
+
+	return pipeline, nil
+}
+
+type Pipeline struct {
+	Debug bool `yaml:"debug"`
+
+	UnitsFrom  []string   `yaml:"units_from,omitempty"`
+	Inputs     []*Input   `yaml:"inputs,omitempty"`
+	Transforms Transforms `yaml:"transformations,omitempty"`
+	Output     Output     `yaml:"output"`
+
+	Parameters map[string]string `yaml:"parameters"`
+
+	logger           *slog.Logger
+	currentDirectory string
+	veneersRewriter  *rewrite.Rewriter
+	converterConfig  *languages.ConverterConfig
+	interpolator     ParametersInterpolator
+	unitsMerged      bool
+	// directories in which to look for plugin binaries (if empty, falls back to using PATH)
+	pluginDirs []string
+}
+
+func NewPipeline() (*Pipeline, error) {
+	currentDir, err := os.Getwd()
+	if err != nil {
+		return nil, err
+	}
+
+	pipeline := &Pipeline{
+		logger:           slog.New(logs.NoopHandler()),
+		currentDirectory: currentDir,
+		Parameters: map[string]string{
+			"__config_dir": currentDir,
+		},
+	}
+
+	pipeline.interpolator = createInterpolator(pipeline.Parameters)
+
+	return pipeline, nil
+}
+
+func (pipeline *Pipeline) interpolateParameters() {
+	pipeline.UnitsFrom = tools.Map(pipeline.UnitsFrom, pipeline.interpolator)
+
+	for _, input := range pipeline.Inputs {
+		// An error can only happen with the input isn't descriptive.
+		// This case should have already been handled before
+		// interpolateParameters() is called.
+		_ = input.InterpolateParameters(pipeline.interpolator)
+	}
+
+	pipeline.Transforms.interpolateParameters(pipeline.interpolator)
+	pipeline.Output.interpolateParameters(pipeline.interpolator)
+}
+
+func (pipeline *Pipeline) jenniesConfig() languages.Config {
+	return languages.Config{
+		Debug:        pipeline.Debug,
+		Types:        pipeline.Output.Types,
+		Builders:     pipeline.Output.Builders,
+		Converters:   pipeline.Output.Converters,
+		APIReference: pipeline.Output.APIReference,
+	}
+}
+
+func (pipeline *Pipeline) commonPasses() (transforms.Transforms, error) {
+	if pipeline.Transforms.CommonPasses != nil {
+		return pipeline.Transforms.CommonPasses, nil
+	}
+
+	return cogyaml.NewTransformsLoader().LoadFiles(pipeline.Transforms.CommonPassesFiles)
+}
+
+func (pipeline *Pipeline) finalPasses() transforms.Transforms {
+	return pipeline.Transforms.FinalPasses
+}
+
+func (pipeline *Pipeline) veneers() (*rewrite.Rewriter, error) {
+	if pipeline.veneersRewriter != nil {
+		return pipeline.veneersRewriter, nil
+	}
+
+	var veneerFiles []string
+	for _, file := range pipeline.Transforms.VeneersPaths {
+		isSingleFile, err := isFile(file)
+		if err != nil {
+			return nil, err
+		}
+
+		if isSingleFile {
+			veneerFiles = append(veneerFiles, file)
+		} else {
+			globPattern := filepath.Join(file, "*.yaml")
+			matches, err := filepath.Glob(globPattern)
+			if err != nil {
+				return nil, err
+			}
+
+			veneerFiles = append(veneerFiles, matches...)
+		}
+	}
+
+	rewriter, err := cogyaml.NewVeneersLoader().RewriterFrom(pipeline.logger, veneerFiles, rewrite.Config{
+		Debug: pipeline.Debug,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	pipeline.veneersRewriter = rewriter
+
+	return pipeline.veneersRewriter, nil
+}
+
+func (pipeline *Pipeline) readConverterConfig() (*languages.ConverterConfig, error) {
+	if pipeline.converterConfig != nil {
+		return pipeline.converterConfig, nil
+	}
+
+	cfg, err := cogyaml.NewConverterConfigReader().ReadConverterConfig(pipeline.Transforms.ConverterConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	runtimeConfig := make([]languages.RuntimeConfig, len(cfg.Runtime))
+	for i, rm := range cfg.Runtime {
+		runtimeConfig[i] = languages.RuntimeConfig{
+			Package:            rm.Package,
+			Name:               rm.Name,
+			NameFunc:           rm.NameFunc,
+			DiscriminatorField: rm.DiscriminatorField,
+		}
+	}
+
+	pipeline.converterConfig = &languages.ConverterConfig{
+		RuntimeConfig: runtimeConfig,
+	}
+	return pipeline.converterConfig, err
+}
+
+func (pipeline *Pipeline) outputDir(relativeToDir string) (string, error) {
+	if !filepath.IsAbs(pipeline.Output.Directory) {
+		return pipeline.Output.Directory, nil
+	}
+
+	return filepath.Rel(relativeToDir, pipeline.Output.Directory)
+}
+
+func (pipeline *Pipeline) languageOutputDir(relativeToDir string, language string) (string, error) {
+	outputDir, err := pipeline.outputDir(relativeToDir)
+	if err != nil {
+		return "", err
+	}
+
+	return strings.ReplaceAll(outputDir, "%l", language), nil
+}
+
+// mergeUnit merges the given unit into the pipeline.
+func (pipeline *Pipeline) mergeUnit(unit *Unit) {
+	for _, input := range unit.Inputs {
+		pipeline.Inputs = append(pipeline.Inputs, input)
+	}
+
+	for _, builderTransform := range unit.BuilderTransforms {
+		pipeline.Transforms.VeneersPaths = append(pipeline.Transforms.VeneersPaths, builderTransform)
+	}
+}
+
+// LoadUnits loads and merges the codegen units into the current pipeline.
+func (pipeline *Pipeline) LoadUnits() error {
+	// Just making sure that this function is idempotent.
+	if pipeline.unitsMerged {
+		return nil
+	}
+
+	for _, unit := range pipeline.UnitsFrom {
+		matches, err := filepath.Glob(unit)
+		if err != nil {
+			return err
+		}
+
+		for _, match := range matches {
+			unit, err := unitFromFile(match, pipeline.Parameters)
+			if err != nil {
+				return err
+			}
+
+			pipeline.mergeUnit(unit)
+		}
+	}
+
+	pipeline.unitsMerged = true
+
+	return nil
+}
+
+// LoadSchemas parses the schemas described by the pipeline and applies common
+// transformations.
+// Note: input-specific transformations are applied.
+func (pipeline *Pipeline) LoadSchemas(ctx context.Context) (ir.Schemas, error) {
+	var allSchemas ir.Schemas
+	var err error
+
+	// Merge additional units into the main pipeline
+	if err := pipeline.LoadUnits(); err != nil {
+		return nil, err
+	}
+
+	// Parse inputs
+	for _, input := range pipeline.Inputs {
+		schemas, err := input.LoadSchemas(ctx, pipeline.logger)
+		if err != nil {
+			return nil, err
+		}
+
+		allSchemas = append(allSchemas, schemas...)
+	}
+
+	if allSchemas == nil {
+		return nil, nil
+	}
+
+	allSchemas, err = allSchemas.Consolidate()
+	if err != nil {
+		return nil, err
+	}
+
+	// Apply common and final compiler passes
+	commonPasses, err := pipeline.commonPasses()
+	if err != nil {
+		return nil, fmt.Errorf("could not initialize common schema transformations: %w", err)
+	}
+
+	allSchemas, err = commonPasses.Process(pipeline.logger, allSchemas)
+	if err != nil {
+		return nil, fmt.Errorf("could not apply common schema transformations: %w", err)
+	}
+
+	return allSchemas, err
+}
+
+func (pipeline *Pipeline) OutputLanguages() (languages.Languages, error) {
+	outputs := make(languages.Languages)
+
+	for _, output := range pipeline.Output.Languages {
+		switch {
+		case output.Go != nil:
+			outputs[golang.LanguageRef] = golang.New(pipeline.logger.With(slog.String("language", "golang")), *output.Go)
+		case output.Java != nil:
+			outputs[java.LanguageRef] = java.New(pipeline.logger.With(slog.String("language", "java")), *output.Java)
+		case output.JSONSchema != nil:
+			outputs[jsonschema.LanguageRef] = jsonschema.New(pipeline.logger.With(slog.String("language", "jsonschema")), *output.JSONSchema)
+		case output.OpenAPI != nil:
+			outputs[openapi.LanguageRef] = openapi.New(pipeline.logger.With(slog.String("language", "openapi")), *output.OpenAPI)
+		case output.PHP != nil:
+			outputs[php.LanguageRef] = php.New(pipeline.logger.With(slog.String("language", "php")), *output.PHP)
+		case output.Python != nil:
+			outputs[python.LanguageRef] = python.New(pipeline.logger.With(slog.String("language", "python")), *output.Python)
+		case output.Typescript != nil:
+			outputs[typescript.LanguageRef] = typescript.New(pipeline.logger.With(slog.String("language", "typescript")), *output.Typescript)
+		case output.Terraform != nil:
+			outputs[terraform.LanguageRef] = terraform.New(pipeline.logger.With(slog.String("language", "terraform")), *output.Terraform)
+		default:
+			return nil, fmt.Errorf("empty language configuration")
+		}
+	}
+
+	for name, config := range pipeline.Output.LanguagePlugins {
+		languagePlugin, err := remote.New(pipeline.logger.With(slog.String("language", name)), name, pipeline.pluginDirs, config)
+		if err != nil {
+			return nil, fmt.Errorf("could not initialize '%s' language plugin: %w", name, err)
+		}
+
+		outputs[name] = languagePlugin
+	}
+
+	return outputs, nil
+}

@@ -1,0 +1,45 @@
+package typescript
+
+import (
+	"testing"
+
+	"github.com/grafana/cog/internal/builders"
+	"github.com/grafana/cog/internal/testutils"
+	"github.com/grafana/cog/pkg/apiref"
+	"github.com/grafana/cog/pkg/languages"
+	"github.com/grafana/cog/pkg/logs"
+	"github.com/stretchr/testify/require"
+)
+
+func TestBuilder_Generate(t *testing.T) {
+	test := testutils.GoldenFilesTestSuite[languages.Context]{
+		TestDataRoot: "../../../testdata/jennies/builders",
+		Name:         "TypescriptBuilder",
+		Skip: map[string]string{
+			"dashboard_panel": "this test if for Java generics for dashboard.Panel",
+		},
+	}
+
+	config := Config{}
+	config.applyDefaults()
+	language := New(logs.NoopLogger(), config)
+	jenny := Builder{
+		config:          config,
+		tmpl:            initTemplates(language.config, apiref.NewAPIReferenceCollector()),
+		apiRefCollector: apiref.NewAPIReferenceCollector(),
+	}
+
+	test.Run(t, func(tc *testutils.Test[languages.Context]) {
+		var err error
+		req := require.New(tc)
+
+		context := tc.UnmarshalJSONInput(testutils.BuildersContextInputFile)
+		context.Builders, err = builders.GenerateNilChecks(language.NullableKinds(), context.Schemas, context.Builders)
+		req.NoError(err)
+
+		files, err := jenny.Generate(context)
+		req.NoError(err)
+
+		tc.WriteFiles(files)
+	})
+}

@@ -1,0 +1,86 @@
+name: CI
+on:
+  pull_request: ~
+  push:
+    branches: [main] # so that we build a Go cache that can be re-used in PRs
+
+permissions:
+  contents: read
+
+env:
+  DEVBOX_VERSION: 0.18.5
+
+jobs:
+  linters:
+    name: Linters
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Restore go vendors
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-deps-${{ runner.os }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-deps-${{ runner.os }}
+
+      - name: Install devbox
+        uses: jetify-com/devbox-install-action@8c6a66ed6273138b1915457069de78cb52fe3bd7 # v0.15.0
+        with:
+          enable-cache: true
+          devbox-version: ${{ env.DEVBOX_VERSION }}
+
+      - name: Run golangci-lint
+        run: make lint
+
+  tests:
+    name: Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Restore go vendors
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # 6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-deps-${{ runner.os }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-deps-${{ runner.os }}
+
+      - name: Install devbox
+        uses: jetify-com/devbox-install-action@8c6a66ed6273138b1915457069de78cb52fe3bd7 # v0.15.0
+        with:
+          enable-cache: true
+          devbox-version: ${{ env.DEVBOX_VERSION }}
+
+      - name: Tests
+        run: make tests
+
+  docs:
+    name: Generate docs
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install devbox
+        uses: jetify-com/devbox-install-action@8c6a66ed6273138b1915457069de78cb52fe3bd7 # v0.15.0
+        with:
+          enable-cache: true
+          devbox-version: ${{ env.DEVBOX_VERSION }}
+
+      - name: Docs
+        run: make docs

@@ -1,0 +1,1156 @@
+package simplecue
+
+import (
+	"fmt"
+	"strconv"
+	"strings"
+
+	"cuelang.org/go/cue"
+	cueast "cuelang.org/go/cue/ast"
+	"cuelang.org/go/cue/format"
+	"cuelang.org/go/cue/token"
+	"github.com/grafana/cog/pkg/ir"
+)
+
+const cogAnnotationName = "cog"
+const cuetsyAnnotationName = "cuetsy"
+const hintKindEnum = "enum"
+const annotationKindFieldName = "kind"
+const enumMembersAttr = "memberNames"
+
+type LibraryInclude struct {
+	FSPath     string // path of the library on the filesystem
+	ImportPath string // path used in CUE files to import that library
+}
+
+type NameFunc func(value cue.Value, path cue.Path) string
+type externalReferenceFunc func(referredPkg string, referredType string, defaultValue any, value cue.Value) (ir.Type, error)
+
+type Config struct {
+	// Package name used to generate code into.
+	Package string
+
+	// SourcePackage is the original package name used in the original schema
+	// source file. May be equal to Package, but can be different.
+	SourcePackage string
+
+	// ForceNamedEnvelope decorates the parsed cue Value with an envelope whose
+	// name is given. This is useful for dataqueries for example, where the
+	// schema doesn't define any suitable top-level object.
+	ForceNamedEnvelope string
+
+	SchemaMetadata ir.SchemaMeta
+
+	Libraries []LibraryInclude
+
+	// NameFunc allows users to specify an alternative naming strategy for
+	// objects and references. It is called with the value passed to the top
+	// level method or function and the path to the entity being parsed.
+	NameFunc NameFunc
+
+	// InlineExternalReference instructs the parser to follow external
+	// references (ie: references to objects outside the current schema)
+	// and inline them.
+	// By default, external references are parsed as actual `ast.Ref` to the
+	// external objects.
+	InlineExternalReference bool
+}
+
+type generator struct {
+	schema       *ir.Schema
+	refResolver  *referenceResolver
+	rootVal      cue.Value
+	rootPath     cue.Path
+	rootFilename string
+
+	namingFunc            NameFunc
+	externalReferenceFunc externalReferenceFunc
+}
+
+func GenerateAST(val cue.Value, c Config) (*ir.Schema, error) {
+	g := &generator{
+		schema: ir.NewSchema(c.Package, c.SchemaMetadata),
+		refResolver: newReferenceResolver(val, referenceResolverConfig{
+			Libraries:     c.Libraries,
+			SchemaPackage: c.Package,
+			SourcePackage: c.SourcePackage,
+		}),
+		rootVal:      val,
+		rootPath:     val.Path(),
+		rootFilename: getFilename(val), // TODO: does this still work with cue modules?
+		namingFunc:   c.NameFunc,
+	}
+
+	if g.namingFunc == nil {
+		g.namingFunc = func(value cue.Value, path cue.Path) string {
+			selectors := path.Selectors()
+			return selectorLabel(selectors[len(selectors)-1])
+		}
+	}
+
+	if c.InlineExternalReference {
+		g.externalReferenceFunc = g.externalReferenceInlineTarget
+	} else {
+		g.externalReferenceFunc = g.externalReferenceAsReference
+	}
+
+	if c.ForceNamedEnvelope != "" {
+		if err := g.walkCueSchemaWithEnvelope(c.ForceNamedEnvelope, val); err != nil {
+			return nil, fmt.Errorf("[%s] %w", c.Package, err)
+		}
+	} else {
+		if err := g.walkCueSchema(val); err != nil {
+			return nil, fmt.Errorf("[%s] %w", c.Package, err)
+		}
+	}
+
+	return g.schema, nil
+}
+
+func (g *generator) walkCueSchemaWithEnvelope(envelopeName string, v cue.Value) error {
+	i, err := v.Fields(cue.Definitions(true), cue.Optional(true))
+	if err != nil {
+		return err
+	}
+
+	var rootObjectFields []ir.StructField
+	for i.Next() {
+		if i.Selector().IsDefinition() {
+			name := g.namingFunc(g.rootVal, i.Value().Path())
+			if err := g.declareObject(name, i.Value()); err != nil {
+				return err
+			}
+			continue
+		}
+
+		nodeType, err := g.declareNode(i.Value())
+		if err != nil {
+			return err
+		}
+
+		name := selectorLabel(i.Selector())
+		structField := ir.NewStructField(name, nodeType, ir.Comments(commentsFromCueValue(i.Value())))
+		structField.Required = !i.IsOptional()
+
+		rootObjectFields = append(rootObjectFields, structField)
+	}
+
+	if len(rootObjectFields) == 0 {
+		return nil
+	}
+
+	structType := ir.NewStruct(rootObjectFields...)
+	if g.schema.Metadata.Variant != "" {
+		structType.Hints[ir.HintImplementsVariant] = string(g.schema.Metadata.Variant)
+	}
+
+	g.schema.AddObject(ir.Object{
+		Name:     envelopeName,
+		Comments: commentsFromCueValue(v),
+		Type:     structType,
+		SelfRef: ir.RefType{
+			ReferredPkg:  g.schema.Package,
+			ReferredType: envelopeName,
+		},
+	})
+
+	g.schema.EntryPoint = envelopeName
+	g.schema.EntryPointType = g.schema.Objects.Get(envelopeName).SelfRef.AsType()
+
+	return nil
+}
+
+func (g *generator) walkCueSchema(v cue.Value) error {
+	i, err := v.Fields(cue.Definitions(true))
+	if err != nil {
+		return err
+	}
+
+	for i.Next() {
+		name := g.namingFunc(g.rootVal, i.Value().Path())
+		if err := g.declareObject(name, i.Value()); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (g *generator) declareObject(name string, v cue.Value) error {
+	if g.schema.Objects.Has(name) {
+		return nil
+	}
+
+	objectDef := ir.Object{
+		Name:     name,
+		Comments: commentsFromCueValue(v),
+		SelfRef: ir.RefType{
+			ReferredPkg:  g.schema.Package,
+			ReferredType: name,
+		},
+	}
+
+	// declare the object early, to help with recursive definitions
+	g.schema.AddObject(objectDef)
+
+	var err error
+	var nodeType ir.Type
+
+	// Try to guess if `v` can be represented as an enum
+	implicitEnum, err := isImplicitEnum(v)
+	if err != nil {
+		return err
+	}
+	if implicitEnum {
+		defVal, err := g.extractDefault(v)
+		if err != nil {
+			return err
+		}
+
+		nodeType, err = g.declareAnonymousEnum(v, defVal, hintsFromCueValue(v))
+		if err != nil {
+			return err
+		}
+	} else {
+		nodeType, err = g.declareNode(v)
+		if err != nil {
+			return err
+		}
+	}
+
+	objectDef.Type = nodeType
+
+	g.schema.Objects.Set(name, objectDef)
+
+	return nil
+}
+
+func (g *generator) extractEnumValues(v cue.Value) ([]ir.EnumValue, error) {
+	_, dvals := v.Expr()
+	a := v.Attribute(cogAnnotationName)
+	// try to fall-back on the cuetsy annotation
+	if a.Err() != nil {
+		a = v.Attribute(cuetsyAnnotationName)
+	}
+
+	var attrMemberNameExist bool
+	var evals []string
+	if a.Err() == nil {
+		val, found, err := a.Lookup(0, enumMembersAttr)
+		if err == nil && found {
+			attrMemberNameExist = true
+			evals = strings.Split(val, "|")
+			if len(evals) != len(dvals) {
+				return nil, errorWithCueRef(v, "enums and %s attributes size doesn't match", enumMembersAttr)
+			}
+		}
+	}
+
+	// We only allowed String Enum to be generated without memberName attribute
+	if v.IncompleteKind() != cue.StringKind && !attrMemberNameExist {
+		return nil, errorWithCueRef(v, "numeric enums may only be generated from memberNames attribute")
+	}
+
+	subType := ir.String()
+	if v.IncompleteKind() == cue.IntKind {
+		subType = ir.NewScalar(ir.KindInt64)
+	}
+
+	var fields []ir.EnumValue
+	for idx, dv := range dvals {
+		var text string
+		if attrMemberNameExist {
+			text = evals[idx]
+		} else {
+			text, _ = dv.String()
+		}
+
+		if !dv.IsConcrete() {
+			return nil, errorWithCueRef(v, "enums may only be generated from a disjunction of concrete strings or numbers")
+		}
+
+		val, err := cueConcreteToScalar(dv)
+		if err != nil {
+			return nil, err
+		}
+
+		fields = append(fields, ir.EnumValue{
+			Type:  subType,
+			Name:  text,
+			Value: val,
+		})
+	}
+
+	return fields, nil
+}
+
+func (g *generator) structFields(v cue.Value) ([]ir.StructField, error) {
+	// This check might be too restrictive
+	if v.IncompleteKind() != cue.StructKind {
+		return nil, errorWithCueRef(v, "top-level type definitions may only be generated from structs")
+	}
+
+	var fields []ir.StructField
+
+	// explore struct fields
+	for i, _ := v.Fields(cue.Optional(true), cue.Definitions(true)); i.Next(); {
+		fieldLabel := selectorLabel(i.Selector())
+
+		// inline object definition
+		if i.Selector().IsDefinition() {
+			if err := g.declareObject(fieldLabel, i.Value()); err != nil {
+				return nil, err
+			}
+			continue
+		}
+
+		// "normal" field
+		node, err := g.declareNode(i.Value())
+		if err != nil {
+			return nil, err
+		}
+
+		field := ir.NewStructField(fieldLabel, node, ir.Comments(commentsFromCueValue(i.Value())))
+		field.Required = !i.IsOptional()
+
+		fields = append(fields, field)
+	}
+
+	return fields, nil
+}
+
+func (g *generator) declareNode(v cue.Value) (ir.Type, error) {
+	v = g.removeTautologicalUnification(v)
+
+	// This node is referring to another definition
+	if ok, v, def := getReference(v); ok {
+		return g.declareReference(v, def)
+	}
+
+	defVal, err := g.extractDefault(v)
+	if err != nil {
+		return ir.Type{}, err
+	}
+
+	hints := hintsFromCueValue(v)
+
+	op, disjunctionBranches := v.Expr()
+	if op == cue.OrOp && len(disjunctionBranches) > 1 {
+		return g.declareDisjunction(v, hints, defVal)
+	}
+
+	switch v.IncompleteKind() {
+	case cue.TopKind:
+		return ir.Any(), nil
+	case cue.NullKind:
+		return ir.Null(), nil
+	case cue.BoolKind:
+		opts, err := g.scalarTypeOptions(v, defVal, hints)
+		if err != nil {
+			return ir.Type{}, err
+		}
+
+		return ir.Bool(opts...), nil
+	case cue.BytesKind:
+		opts, err := g.scalarTypeOptions(v, defVal, hints)
+		if err != nil {
+			return ir.Type{}, err
+		}
+
+		return ir.Bytes(opts...), nil
+	case cue.StringKind:
+		return g.declareString(v, defVal, hints)
+	case cue.FloatKind, cue.NumberKind, cue.IntKind:
+		return g.declareNumber(v, defVal, hints)
+	case cue.ListKind:
+		return g.declareList(v, defVal, hints)
+	case cue.StructKind:
+		// to make sure that we look at the actual OP
+		evaluated := v.Eval()
+
+		// in cue: {...}, {[string]: type}, or inline struct
+		if op, _ := evaluated.Expr(); op == cue.NoOp {
+			anyString := evaluated.LookupPath(cue.MakePath(cue.AnyString))
+			if anyString.Exists() && !hasStructFields(evaluated) {
+				typeDef, err := g.declareNode(anyString)
+				if err != nil {
+					return ir.Type{}, err
+				}
+
+				return ir.NewMap(ir.String(), typeDef, ir.Hints(hints), ir.Default(defVal)), nil
+			}
+		}
+
+		fields, err := g.structFields(v)
+		if err != nil {
+			return ir.Type{}, err
+		}
+
+		// {...}
+		if len(fields) == 0 {
+			return ir.Any(), nil
+		}
+
+		def := ir.NewStruct(fields...)
+		// Add the hints since we can't supply them in the constructor
+		def.Hints = hints
+		def.Default = defVal
+
+		return def, nil
+	default:
+		return ir.Type{}, errorWithCueRef(v, "unexpected node with kind '%s'", v.IncompleteKind().String())
+	}
+}
+
+func getReference(v cue.Value) (bool, cue.Value, cue.Value) {
+	_, path := v.ReferencePath()
+	if path.String() != "" {
+		return true, v, v
+	}
+
+	op, exprs := v.Expr()
+
+	if len(exprs) != 2 {
+		return false, v, v
+	}
+
+	_, path = exprs[0].ReferencePath()
+	if v.Kind() == cue.BottomKind && v.IncompleteKind() == cue.StructKind && path.String() != "" {
+		// When a struct with defaults is completely filled, it usually has a NoOp op.
+		if op == cue.NoOp {
+			return true, exprs[0], v
+		}
+
+		// Accepts [AStruct | *{ ... }] and skips [AStruct | BStruct]
+		if _, ok := v.Default(); ok {
+			return true, exprs[0], v
+		}
+	}
+
+	if op == cue.AndOp && exprs[0].Subsume(exprs[1]) == nil && exprs[1].Subsume(exprs[0]) == nil {
+		return true, exprs[0], exprs[1]
+	}
+
+	// We could have a reference unified with a cue.TopKind (_). We can assume that if we have an existing path unified with this
+	// it's a valid reference.
+	if path.String() != "" && exprs[1].IncompleteKind() == cue.TopKind {
+		return true, exprs[0], exprs[0]
+	}
+
+	return false, v, v
+}
+
+func (g *generator) declareReference(v cue.Value, defV cue.Value) (ir.Type, error) {
+	referenceRootValue, path := v.ReferencePath()
+
+	// The reference might point to a value defined "outside" of the original root cue value, but still in the same
+	// schema/cue file.
+	// Ex:
+	// ```cue
+	// #Origin: { creator: string }
+	// spec: { // ← in this hypothetical scenario, the generator receives a cue value pointing here
+	//   title: string
+	//   origin: #Origin // `#Origin` refers to a value outside our original root
+	// }
+	// ```
+	if getFilename(referenceRootValue) == g.rootFilename && !cuePathIsChildOf(g.rootPath, path) {
+		refType := g.namingFunc(g.rootVal, path)
+		if !g.schema.Objects.Has(refType) {
+			if err := g.declareObject(refType, referenceRootValue.LookupPath(path)); err != nil {
+				return ir.Type{}, err
+			}
+		}
+
+		defValue, err := g.extractDefault(defV)
+		if err != nil {
+			return ir.Type{}, err
+		}
+
+		return ir.NewRef(g.schema.Package, refType, ir.Default(defValue)), nil
+	}
+
+	if path.String() != "" {
+		refPkg, err := g.refResolver.PackageForNode(v.Source())
+		if err != nil {
+			return ir.Type{}, errorWithCueRef(v, "%v", err.Error())
+		}
+
+		defValue, err := g.extractDefault(defV)
+		if err != nil {
+			return ir.Type{}, err
+		}
+
+		refType := g.namingFunc(g.rootVal, path)
+
+		if refPkg == "time" && refType == "Time" {
+			return ir.String(ir.Default(defValue), ir.Hints(ir.JenniesHints{
+				ir.HintStringFormatDateTime: true,
+			})), nil
+		}
+
+		if refPkg == "time" && refType == "Duration" {
+			return ir.String(ir.Default(defValue), ir.Hints(ir.JenniesHints{
+				ir.HintStringFormatDuration: true,
+			})), nil
+		}
+
+		// ensure that referenced objects are explored (in case they're not
+		// defined within the "root" cue value given to cog as parsing input)
+		if refPkg == g.schema.Package && !g.schema.Objects.Has(refType) {
+			if err := g.declareObject(refType, referenceRootValue.LookupPath(path)); err != nil {
+				return ir.Type{}, err
+			}
+		}
+
+		// concreteV is v if v is a concrete string/number (e.g. #Enum1 & "A" when "A" is not the default),
+		// or defV when v is abstract but defV is a concrete constraint (e.g. #Enum2 & "C" where "C" is the
+		// default of #Enum2 — CUE's subsumption collapses the conjunction so v becomes the abstract reference).
+		concreteV := v
+		if concreteV.Kind() != cue.StringKind && concreteV.Kind() != cue.NumberKind {
+			concreteV = defV
+		}
+		if concreteV.Kind() == cue.StringKind || concreteV.Kind() == cue.NumberKind {
+			var referenceValue any
+			referenceValue, err = concreteV.String()
+			if err != nil {
+				referenceValue, err = concreteV.Int64()
+				if err != nil {
+					return ir.Type{}, errorWithCueRef(concreteV, "%v", err.Error())
+				}
+			}
+
+			// Sometimes the object isn't added because the scope
+			if !g.schema.Objects.Has(refType) {
+				if err := g.declareObject(refType, referenceRootValue.LookupPath(path)); err != nil {
+					return ir.Type{}, err
+				}
+			}
+
+			return ir.NewConstantReferenceType(refPkg, refType, referenceValue), nil
+		}
+
+		// Reference to another package
+		if refPkg != g.schema.Package {
+			return g.externalReferenceFunc(refPkg, refType, defValue, v)
+		}
+
+		return ir.NewRef(refPkg, refType, ir.Default(defValue)), nil
+	}
+
+	return ir.Type{}, nil
+}
+
+// externalReferenceAsReference represents external references as actual references.
+func (g *generator) externalReferenceAsReference(referredPkg string, referredType string, defaultValue any, _ cue.Value) (ir.Type, error) {
+	return ir.NewRef(referredPkg, referredType, ir.Default(defaultValue)), nil
+}
+
+// externalReferenceInlineTarget inlines external references into the current schema.
+func (g *generator) externalReferenceInlineTarget(_ string, referredType string, defaultValue any, value cue.Value) (ir.Type, error) {
+	if g.schema.Objects.Has(referredType) {
+		return ir.NewRef(g.schema.Package, referredType, ir.Default(defaultValue)), nil
+	}
+
+	// Follow the reference
+	refRoot, refPath := value.ReferencePath()
+	referredValue := refRoot.LookupPath(refPath)
+
+	// Declare the object into the current schema
+	if err := g.declareObject(referredType, referredValue); err != nil {
+		return ir.Type{}, err
+	}
+
+	// And return a local reference to it
+	return ir.NewRef(g.schema.Package, referredType, ir.Default(defaultValue)), nil
+}
+
+func (g *generator) declareDisjunction(v cue.Value, hints ir.JenniesHints, defaultValue any) (ir.Type, error) {
+	// Possible cases:
+	// 1. "value" | "other_value" | "concrete_value" → we want to parse that as an "enum" type
+	// 2. SomeType | SomeOtherType | string → we want to parse that as a disjunction
+
+	// Try to guess if `v` can be represented as an enum (includes checking for a type hint) (1)
+	implicitEnum, err := isImplicitEnum(v)
+	if err != nil {
+		return ir.Type{}, err
+	}
+	if implicitEnum {
+		return g.declareAnonymousEnum(v, defaultValue, hints)
+	}
+
+	_, disjunctionBranchesWithPossibleDefault := v.Expr()
+	defaultAsCueValue, hasDefault := v.Default()
+
+	disjunctionBranches := make([]cue.Value, 0, len(disjunctionBranchesWithPossibleDefault))
+	for _, branch := range disjunctionBranchesWithPossibleDefault {
+		if hasDefault && branch.Equals(defaultAsCueValue) {
+			_, bPath := branch.ReferencePath()
+			_, dPath := defaultAsCueValue.ReferencePath()
+
+			if bPath.String() == dPath.String() {
+				continue
+			}
+		}
+
+		disjunctionBranches = append(disjunctionBranches, branch)
+	}
+
+	// not a disjunction anymore
+	if len(disjunctionBranchesWithPossibleDefault) != len(disjunctionBranches) && len(disjunctionBranches) == 1 {
+		return g.declareNode(disjunctionBranches[0])
+	}
+
+	// We must be looking at a disjunction then (2)
+	branches := make([]ir.Type, 0, len(disjunctionBranches))
+	for _, subTypeValue := range disjunctionBranches {
+		subType, err := g.declareNode(subTypeValue)
+		if err != nil {
+			return ir.Type{}, err
+		}
+
+		branches = append(branches, subType)
+	}
+
+	return ir.NewDisjunction(branches, ir.Default(defaultValue), ir.Hints(hints)), nil
+}
+
+func (g *generator) declareAnonymousEnum(v cue.Value, defValue any, hints ir.JenniesHints) (ir.Type, error) {
+	allowed := cue.StringKind | cue.IntKind
+	ik := v.IncompleteKind()
+	if ik&allowed != ik {
+		return ir.Type{}, errorWithCueRef(v, "enums may only be generated from concrete strings, or ints")
+	}
+
+	values, err := g.extractEnumValues(v)
+	if err != nil {
+		return ir.Type{}, err
+	}
+
+	return ir.NewEnum(values, ir.Default(defValue), ir.Hints(hints)), nil
+}
+
+func (g *generator) scalarTypeOptions(v cue.Value, defVal any, hints ir.JenniesHints) ([]ir.TypeOption, error) {
+	opts := []ir.TypeOption{
+		ir.Default(defVal),
+		ir.Hints(hints),
+	}
+
+	if v.IsConcrete() {
+		val, err := cueConcreteToScalar(v)
+		if err != nil {
+			return nil, err
+		}
+
+		opts = append(opts, ir.Value(val))
+	}
+
+	return opts, nil
+}
+
+func (g *generator) declareString(v cue.Value, defVal any, hints ir.JenniesHints) (ir.Type, error) {
+	opts, err := g.scalarTypeOptions(v, defVal, hints)
+	if err != nil {
+		return ir.Type{}, err
+	}
+
+	ok, t, err := g.stringOrIntegerFromEnum(v, defVal, opts)
+	if err != nil {
+		return ir.Type{}, err
+	}
+	if ok {
+		return t, nil
+	}
+
+	typeDef := ir.String(opts...)
+
+	// Extract constraints
+	constraints, err := g.declareStringConstraints(v)
+	if err != nil {
+		return typeDef, err
+	}
+
+	typeDef.Scalar.Constraints = constraints
+
+	conjuncts := appendSplit(nil, cue.AndOp, v)
+	for _, conjunct := range conjuncts {
+		_, path := conjunct.ReferencePath()
+		switch path.String() {
+		case "Time": // time.Time
+			typeDef.Hints[ir.HintStringFormatDateTime] = true
+		case "Duration": // time.Duration
+			typeDef.Hints[ir.HintStringFormatDuration] = true
+		}
+	}
+
+	return typeDef, nil
+}
+
+func (g *generator) extractDefault(v cue.Value) (any, error) {
+	defaultVal, ok := v.Default()
+	if !ok {
+		// nolint: nilnil
+		return nil, nil
+	}
+
+	def, err := cueConcreteToScalar(defaultVal)
+	if err != nil {
+		return nil, err
+	}
+
+	return def, nil
+}
+
+func (g *generator) declareStringConstraints(v cue.Value) ([]ir.TypeConstraint, error) {
+	typeAndConstraints := appendSplit(nil, cue.AndOp, v)
+
+	// nothing to do
+	if len(typeAndConstraints) == 1 {
+		return nil, nil
+	}
+
+	// the constraint allows cue to infer a concrete value
+	// ex: #SomeEnumType & "some value from the enum"
+	if v.IsConcrete() {
+		stringVal, err := v.String()
+		if err != nil {
+			return nil, errorWithCueRef(v, "could not convert concrete value to string")
+		}
+
+		return []ir.TypeConstraint{
+			{
+				Op:   ir.EqualOp,
+				Args: []any{stringVal},
+			},
+		}, nil
+	}
+
+	constraints := make([]ir.TypeConstraint, 0, len(typeAndConstraints))
+
+	for i := 0; i < len(typeAndConstraints); i++ {
+		andExpr := typeAndConstraints[i]
+		op, args := andExpr.Expr()
+
+		switch op {
+		case cue.SelectorOp:
+			scope, refPath := andExpr.ReferencePath()
+			typeAndConstraints = append(typeAndConstraints, scope.LookupPath(refPath))
+		case cue.CallOp:
+			// TODO: support more constraints?
+			switch fmt.Sprint(args[0]) {
+			case "strings.MinRunes":
+				scalar, err := cueConcreteToScalar(args[1])
+				if err != nil {
+					return nil, err
+				}
+
+				constraints = append(constraints, ir.TypeConstraint{
+					Op:   ir.MinLengthOp,
+					Args: []any{scalar},
+				})
+
+			case "strings.MaxRunes":
+				scalar, err := cueConcreteToScalar(args[1])
+				if err != nil {
+					return nil, err
+				}
+
+				constraints = append(constraints, ir.TypeConstraint{
+					Op:   ir.MaxLengthOp,
+					Args: []any{scalar},
+				})
+			}
+		case cue.RegexMatchOp:
+			scalar, err := cueConcreteToScalar(args[0])
+			if err != nil {
+				return nil, err
+			}
+
+			constraints = append(constraints, ir.TypeConstraint{
+				Op:   ir.RegexMatchOp,
+				Args: []any{scalar},
+			})
+		case cue.NotRegexMatchOp:
+			scalar, err := cueConcreteToScalar(args[0])
+			if err != nil {
+				return nil, err
+			}
+
+			constraints = append(constraints, ir.TypeConstraint{
+				Op:   ir.NotRegexMatchOp,
+				Args: []any{scalar},
+			})
+		default:
+			// TODO: support more OPs?
+		}
+	}
+
+	return constraints, nil
+}
+
+func (g *generator) declareNumber(v cue.Value, defVal any, hints ir.JenniesHints) (ir.Type, error) {
+	numberTypeWithConstraintsAsString, err := format.Node(v.Syntax())
+	if err != nil {
+		return ir.Type{}, err
+	}
+	parts := strings.Split(string(numberTypeWithConstraintsAsString), " ")
+	if len(parts) == 0 {
+		return ir.Type{}, errorWithCueRef(v, "something went very wrong while formatting a number expression into a string")
+	}
+
+	// dirty way of preserving the actual type from cue
+	// note that CUE has predefined "types": https://cuelang.org/docs/tutorials/tour/types/bounddef/
+	var numberType ir.ScalarKind
+	for _, numberTypeCandidate := range parts {
+		switch ir.ScalarKind(numberTypeCandidate) {
+		case ir.KindFloat32, ir.KindFloat64:
+			numberType = ir.ScalarKind(numberTypeCandidate)
+		case ir.KindUint8, ir.KindUint16, ir.KindUint32, ir.KindUint64:
+			numberType = ir.ScalarKind(numberTypeCandidate)
+		case ir.KindInt8, ir.KindInt16, ir.KindInt32, ir.KindInt64:
+			numberType = ir.ScalarKind(numberTypeCandidate)
+		case "uint":
+			numberType = ir.KindUint64
+		case "int":
+			numberType = ir.KindInt64
+		case "float":
+			numberType = ir.KindFloat64
+		case "number":
+			numberType = ir.KindFloat64
+		}
+	}
+
+	// the heuristic above will likely fail for concrete numbers, so let's handle them explicitly
+	if numberType == "" && v.IsConcrete() {
+		switch v.Kind() {
+		case cue.FloatKind:
+			numberType = ir.KindFloat64
+		case cue.IntKind:
+			numberType = ir.KindInt64
+		case cue.NumberKind:
+			numberType = ir.KindFloat64
+		}
+	}
+
+	if numberType == "" {
+		return ir.Type{}, errorWithCueRef(v, "could not infer number type from expression '%s'", numberTypeWithConstraintsAsString)
+	}
+
+	// The simplified syntax above names a type whenever bounds happen to fit
+	// one, and drops the bound it absorbed: `int & <=2147483647` is
+	// formatted as `int32`. For integers, take the width from the declared
+	// type and the bounds from the raw syntax of the evaluated value instead.
+	constraintsSyntax := v.Syntax()
+	if isIntegerKind(numberType) && !v.IsConcrete() {
+		if declared, ok := declaredIntegerKind(v, numberType); ok {
+			numberType = declared
+			constraintsSyntax = v.Eval().Syntax(cue.Raw())
+		}
+	}
+
+	typeDef := ir.NewScalar(numberType, ir.Default(defVal), ir.Hints(hints))
+
+	// v.IsConcrete() being true means we're looking at a constant/known value
+	if v.IsConcrete() {
+		val, err := cueConcreteToScalar(v)
+		if err != nil {
+			return typeDef, err
+		}
+
+		typeDef.Scalar.Value = val
+	}
+
+	// If the default (all lists have a default, usually self, ugh) differs from the
+	// input list, peel it off. Otherwise, our AnyIndex lookup may end up getting
+	// sent on the wrong path.
+
+	// extract constraints
+	constraints, err := g.declareNumberConstraints(constraintsSyntax, numberType)
+	if err != nil {
+		return ir.Type{}, err
+	}
+
+	typeDef.Scalar.Constraints = constraints
+
+	return typeDef, nil
+}
+
+// declareNumberConstraints extracts the bounds of a number from its syntax.
+// Bounds that only restate the limits of the number type are omitted.
+//
+// having written this makes my soul hurt.
+func (g *generator) declareNumberConstraints(node cueast.Node, numberType ir.ScalarKind) ([]ir.TypeConstraint, error) {
+	var constraints []ir.TypeConstraint
+
+	var walk func(cueast.Expr)
+	walk = func(e cueast.Expr) {
+		switch x := e.(type) {
+		case *cueast.BinaryExpr:
+			switch x.Op {
+			case token.AND:
+				walk(x.X)
+				walk(x.Y)
+
+			case token.OR:
+				if isDefault(x.X) {
+					walk(x.Y)
+				} else if isDefault(x.Y) {
+					walk(x.X)
+				}
+			}
+		case *cueast.UnaryExpr:
+			if x.Op == token.MUL {
+				return
+			}
+			switch x.Op {
+			case token.GTR, token.GEQ, token.LSS, token.LEQ, token.EQL, token.NEQ:
+				raw, ok := extractNumber(x.X)
+				if !ok {
+					return
+				}
+
+				if impliedByIntegerKind(numberType, x.Op, raw) {
+					return
+				}
+
+				arg, err := parseNumber(raw)
+				if err != nil {
+					return
+				}
+
+				constraints = append(constraints, ir.TypeConstraint{
+					Op:   mapTokenToAstOp(x.Op),
+					Args: []any{arg},
+				})
+			}
+		}
+	}
+
+	expr, ok := node.(cueast.Expr)
+	if !ok {
+		return nil, nil
+	}
+
+	walk(expr)
+
+	return constraints, nil
+}
+
+func isDefault(e cueast.Expr) bool {
+	u, ok := e.(*cueast.UnaryExpr)
+	return ok && u.Op == token.MUL
+}
+
+func parseNumber(raw string) (any, error) {
+	if strings.Contains(raw, ".") {
+		return strconv.ParseFloat(raw, 64)
+	}
+	if i, err := strconv.ParseInt(raw, 10, 64); err == nil {
+		return i, nil
+	}
+	return strconv.ParseFloat(raw, 64)
+}
+
+func mapTokenToAstOp(op token.Token) ir.Op {
+	switch op {
+	case token.GTR:
+		return ir.GreaterThanOp
+	case token.GEQ:
+		return ir.GreaterThanEqualOp
+	case token.LSS:
+		return ir.LessThanOp
+	case token.LEQ:
+		return ir.LessThanEqualOp
+	case token.EQL:
+		return ir.EqualOp
+	case token.NEQ:
+		return ir.NotEqualOp
+	default:
+		return ""
+	}
+}
+
+func extractNumber(e cueast.Expr) (string, bool) {
+	switch v := e.(type) {
+	case *cueast.BasicLit:
+		return v.Value, true
+	case *cueast.UnaryExpr:
+		if v.Op == token.SUB {
+			if lit, ok := v.X.(*cueast.BasicLit); ok {
+				return "-" + lit.Value, true
+			}
+		}
+
+		if v.Op == token.ADD {
+			if lit, ok := v.X.(*cueast.BasicLit); ok {
+				return lit.Value, true
+			}
+		}
+	}
+
+	return "", false
+}
+
+func (g *generator) declareListConstraints(v cue.Value) ([]ir.TypeConstraint, error) {
+	conjuncts := appendSplit(nil, cue.AndOp, v)
+
+	if len(conjuncts) == 1 {
+		return nil, nil
+	}
+
+	var constraints []ir.TypeConstraint
+
+	for _, conjunct := range conjuncts {
+		op, args := conjunct.Expr()
+		if op != cue.CallOp {
+			continue
+		}
+
+		switch fmt.Sprint(args[0]) {
+		case "list.MinItems":
+			scalar, err := cueConcreteToScalar(args[1])
+			if err != nil {
+				return nil, err
+			}
+			constraints = append(constraints, ir.TypeConstraint{
+				Op:   ir.MinItemsOp,
+				Args: []any{scalar},
+			})
+
+		case "list.MaxItems":
+			scalar, err := cueConcreteToScalar(args[1])
+			if err != nil {
+				return nil, err
+			}
+			constraints = append(constraints, ir.TypeConstraint{
+				Op:   ir.MaxItemsOp,
+				Args: []any{scalar},
+			})
+
+		case "list.UniqueItems":
+			constraints = append(constraints, ir.TypeConstraint{
+				Op:   ir.UniqueItemsOp,
+				Args: nil,
+			})
+		}
+	}
+
+	return constraints, nil
+}
+
+func (g *generator) declareList(v cue.Value, defVal any, hints ir.JenniesHints) (ir.Type, error) {
+	typeDef := ir.NewArray(ir.Any(), ir.Hints(hints), ir.Default(defVal))
+
+	// closed list are not supported: our IR can't represent them :/
+	// example of closed list:
+	// ```cue
+	// someList: [string, string] // a list with exactly two strings
+	// ```
+	if !v.Allows(cue.AnyIndex) {
+		return ir.Type{}, errorWithCueRef(v, "closed lists are not supported")
+	}
+
+	// If the default (all lists have a default, usually self, ugh) differs from the
+	// input list, peel it off. Otherwise, our AnyIndex lookup may end up getting
+	// sent on the wrong path.
+	defv, _ := v.Default()
+	if !defv.Equals(v) {
+		_, dvals := v.Expr()
+		v = dvals[0]
+	}
+
+	constraints, err := g.declareListConstraints(v)
+	if err != nil {
+		return ir.Type{}, err
+	}
+	typeDef.Array.Constraints = constraints
+
+	e := v.LookupPath(cue.MakePath(cue.AnyIndex))
+	if !e.Exists() {
+		// unreachable?
+		return ir.Type{}, errorWithCueRef(v, "open list must have a type")
+	}
+
+	expr, err := g.declareNode(e)
+	if err != nil {
+		return ir.Type{}, err
+	}
+
+	typeDef.Array.ValueType = expr
+
+	return typeDef, nil
+}
+
+// removeTautologicalUnification simplifies CUE unifications
+// that unify identical branches.
+// Ex: SomeType & SomeType → SomeType
+func (g *generator) removeTautologicalUnification(v cue.Value) cue.Value {
+	op, branches := v.Expr()
+
+	// not a unification
+	if op != cue.AndOp {
+		return v
+	}
+
+	// for now, we only simplify purely binary operations
+	if len(branches) != 2 {
+		return v
+	}
+
+	// If the branches mutually subsume each other, then they should be the same.
+	// In which case we pick only one and return it.
+	if branches[0].Equals(branches[1]) && branches[1].Subsume(branches[0]) == nil && branches[0].Subsume(branches[1]) == nil {
+		return branches[0]
+	}
+
+	return v
+}
+
+// stringOrIntegerFromEnum detects the case when the string is defined with an enum value.
+// When a definition extends from other and override a field defined as enum with a specific value,
+// it detected as its type instead as a reference. Ex: MyEnum & "value"
+func (g *generator) stringOrIntegerFromEnum(v cue.Value, defVal any, opts []ir.TypeOption) (bool, ir.Type, error) {
+	if defVal != nil {
+		return false, ir.Type{}, nil
+	}
+
+	conjuncts := appendSplit(nil, cue.AndOp, v)
+
+	if len(conjuncts) == 1 {
+		return false, ir.Type{}, nil
+	}
+
+	// When a reference extends from other, and it appends a new value, but it does not
+	// override anything
+	if conjuncts[0].IsConcrete() {
+		return false, ir.Type{}, nil
+	}
+
+	// When an element is overriding a field and/or a value, the last element is the value that we want and
+	// the rest of them are similar.
+	if len(conjuncts) > 2 {
+		conjuncts[1] = conjuncts[len(conjuncts)-1]
+	}
+
+	val, err := cueConcreteToScalar(conjuncts[1])
+	if err != nil {
+		return false, ir.Type{}, err
+	}
+
+	if val == nil {
+		return false, ir.Type{}, nil
+	}
+
+	_, path := conjuncts[0].ReferencePath()
+	if path.String() != "" {
+		// ensure that the type referenced in the conjunction is discovered by
+		// the parser and added into the IR
+		if _, err = g.declareNode(conjuncts[0]); err != nil {
+			return false, ir.Type{}, err
+		}
+
+		refType := g.namingFunc(g.rootVal, path)
+		return true, ir.NewConstantReferenceType(g.schema.Package, refType, val, opts...), nil
+	}
+
+	return false, ir.Type{}, nil
+}

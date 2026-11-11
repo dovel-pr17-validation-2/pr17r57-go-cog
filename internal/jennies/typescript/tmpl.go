@@ -1,0 +1,72 @@
+package typescript
+
+import (
+	"embed"
+	"fmt"
+
+	"github.com/grafana/cog/pkg/apiref"
+	"github.com/grafana/cog/pkg/ir"
+	"github.com/grafana/cog/pkg/languages"
+	"github.com/grafana/cog/pkg/template"
+)
+
+//go:embed templates/*.tmpl
+//nolint:gochecknoglobals
+var templatesFS embed.FS
+
+func initTemplates(config Config, apiRefCollector *apiref.APIReferenceCollector) *template.Template {
+	tmpl, err := template.New(
+		"typescript",
+		template.Funcs(template.TypeResolvingHelpers(languages.Context{})),
+		template.Funcs(template.TypesHelpers(languages.Context{})),
+		template.Funcs(apiref.TemplateHelpers(apiRefCollector)),
+		template.Funcs(config.OverridesTemplateFuncs),
+		// placeholder functions, will be overridden by jennies
+		template.Funcs(template.FuncMap{
+			"formatType": func(_ ir.Type) string {
+				panic("formatType() needs to be overridden by a jenny")
+			},
+			"formatRef": func(_ ir.RefType) string {
+				panic("formatRef() needs to be overridden by a jenny")
+			},
+			"formatIdentifier": formatIdentifier,
+			"typeIsDisjunctionOfBuilders": func(_ ir.Type) string {
+				panic("typeIsDisjunctionOfBuilders() needs to be overridden by a jenny")
+			},
+			"defaultValueForType": func(_ ir.Type) string {
+				panic("defaultValueForType() needs to be overridden by a jenny")
+			},
+			"formatValue": func(destinationType ir.Type, value any) string {
+				panic("formatValue() needs to be overridden by a jenny")
+			},
+			"formatPath": func(_ ir.Path) string {
+				panic("formatPath() needs to be overridden by a jenny")
+			},
+			"emptyValueForGuard": func(_ ir.Type) string {
+				panic("emptyValueForGuard() needs to be overridden by a jenny")
+			},
+			"typeHasBuilder": func(_ ir.Type) bool {
+				panic("typeHasBuilder() needs to be overridden by a jenny")
+			},
+			"formatTypeNoBuilder": func(_ ir.Type) bool {
+				panic("formatTypeNoBuilder() needs to be overridden by a jenny")
+			},
+			"resolvesToComposableSlot": func(_ ir.Type) bool {
+				panic("resolvesToComposableSlot() needs to be overridden by a jenny")
+			},
+			"importPkg": func(pkg string) string {
+				panic("importPkg() needs to be overridden by a jenny")
+			},
+		}),
+
+		// parse templates
+		template.ParseFS(templatesFS, "templates"),
+		template.ParseFS(config.OverridesTemplatesFS, "custom"),
+		template.ParseDirectories(config.OverridesTemplatesDirectories...),
+	)
+	if err != nil {
+		panic(fmt.Errorf("could not initialize templates: %w", err))
+	}
+
+	return tmpl
+}

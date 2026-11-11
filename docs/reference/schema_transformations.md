@@ -1,0 +1,557 @@
+<!-- Generated with `make docs` -->
+# Schema transformations
+
+## `add_fields`
+
+AddFields rewrites the definition of an object to add new fields.
+Note: existing fields will not be overwritten.
+
+### Usage
+
+```yaml
+add_fields:
+  # Expected format: [package].[object]
+  to: string
+  fields: []ir.StructField
+```
+
+## `add_object`
+
+AddObject adds a new object to a schema.
+
+### Usage
+
+```yaml
+add_object:
+  object: string
+  as: Type
+  comments: []string
+```
+
+## `anonymous_enum_to_named`
+
+AnonymousEnumToExplicitType turns "anonymous enums" into a named
+object.
+
+Example:
+
+	```
+	Panel struct {
+		Type enum(Foo, Bar, Baz)
+	}
+	```
+
+Will become:
+
+	```
+	Panel struct {
+		Type PanelType
+	}
+
+	PanelType enum(Foo, Bar, Baz)
+	```
+
+Note: this compiler pass looks for anonymous enums in structs and arrays only.
+
+### Usage
+
+```yaml
+anonymous_enum_to_named: {}
+```
+
+## `anonymous_structs_to_named`
+
+AnonymousStructsToNamed turns "anonymous structs" into a named object.
+
+Example:
+
+	```
+	Panel struct {
+		Options struct {
+			Title string
+		}
+	}
+	```
+
+Will become:
+
+	```
+	Panel struct {
+		Options PanelOptions
+	}
+
+	PanelOptions struct {
+		Title string
+	}
+	```
+
+### Usage
+
+```yaml
+anonymous_structs_to_named: {}
+```
+
+## `cleanup_k8_resource_names`
+
+N/A
+
+### Usage
+
+```yaml
+cleanup_k8_resource_names:
+  prefix_to_remove: string
+```
+
+## `constant_to_enum`
+
+ConstantToEnum turns `string` constants into an enum definition with a
+single member.
+This is useful to "future-proof" a schema where a type can have a single
+value for now but is expected to allow more in the future.
+
+Example:
+
+	```
+	ElementType: "thing"
+	```
+
+Will become:
+
+	```
+	ElementType enum {
+		thing = "thing"
+	}
+	```
+
+### Usage
+
+```yaml
+constant_to_enum:
+  objects: []string
+```
+
+## `dataquery_identification`
+
+N/A
+
+### Usage
+
+```yaml
+dataquery_identification: {}
+```
+
+## `deprecate_object`
+
+DeprecateObject marks an object as deprecated.
+Note: builders generated from this object will be marked as well.
+
+### Usage
+
+```yaml
+deprecate_object:
+  object: string
+  message: string
+```
+
+## `disjunction_infer_mapping`
+
+DisjunctionInferMapping infers the discriminator field and mapping used to
+describe a disjunction of references.
+See https://swagger.io/docs/specification/data-models/inheritance-and-polymorphism/
+
+### Usage
+
+```yaml
+disjunction_infer_mapping: {}
+```
+
+## `disjunction_of_anonymous_structs_to_explicit`
+
+DisjunctionOfAnonymousStructsToExplicit looks for anonymous structs used as
+branches of disjunctions and turns them into explicitly named types.
+
+### Usage
+
+```yaml
+disjunction_of_anonymous_structs_to_explicit: {}
+```
+
+## `disjunction_to_type`
+
+DisjunctionToType transforms disjunction into a struct, mapping disjunction branches to
+an optional and nullable field in that struct.
+
+Example:
+
+		```
+		SomeType: {
+			type: "some-type"
+	 	}
+		SomeOtherType: {
+			type: "other-type"
+	 	}
+		SomeStruct: {
+			foo: string | bool
+		}
+		OtherStruct: {
+			bar: SomeType | SomeOtherType
+		}
+		```
+
+Will become:
+
+		```
+		SomeType: {
+			type: "some-type"
+	 	}
+		SomeOtherType: {
+			type: "other-type"
+	 	}
+		StringOrBool: {
+			string: *string
+			bool: *string
+		}
+		SomeStruct: {
+			foo: StringOrBool
+		}
+		SomeTypeOrSomeOtherType: {
+			SomeType: *SomeType
+			SomeOtherType: *SomeOtherType
+		}
+		OtherStruct: {
+			bar: SomeTypeOrSomeOtherType
+		}
+		```
+
+### Usage
+
+```yaml
+disjunction_to_type: {}
+```
+
+## `disjunction_with_constant_to_default`
+
+N/A
+
+### Usage
+
+```yaml
+disjunction_with_constant_to_default: {}
+```
+
+## `duplicate_object`
+
+DuplicateObject duplicates the source object under a different name,
+possibly in a different package.
+
+Note: if the source object isn't found, this pass does nothing.
+
+### Usage
+
+```yaml
+duplicate_object:
+  object: string
+  as: string
+  omit_fields: []string
+```
+
+## `entrypoint_identification`
+
+N/A
+
+### Usage
+
+```yaml
+entrypoint_identification: {}
+```
+
+## `fields_set_default`
+
+FieldsSetDefault sets the default value for the given fields.
+Invalid field references will be ignored and existing default values will be
+overridden.
+
+### Usage
+
+```yaml
+fields_set_default:
+  defaults: map[string]interface {}
+```
+
+## `fields_set_not_required`
+
+FieldsSetNotRequired rewrites the definition of given fields to mark them as nullable and not required.
+
+### Usage
+
+```yaml
+fields_set_not_required:
+  fields: []string
+```
+
+## `fields_set_required`
+
+FieldsSetRequired rewrites the definition of given fields to mark them as not nullable and required.
+
+### Usage
+
+```yaml
+fields_set_required:
+  fields: []string
+```
+
+## `hint_object`
+
+N/A
+
+### Usage
+
+```yaml
+hint_object:
+  object: string
+  hints: JenniesHints
+```
+
+## `name_anonymous_struct`
+
+NameAnonymousStruct rewrites the definition of a struct field typed as an
+anonymous struct to instead refer to a named type.
+
+Example:
+
+	```
+	Field = Panel.DataSource
+	As = DataSourceRef
+	```
+
+	```
+	Panel: {
+		DataSource: {
+			Type: string
+			name: string
+		}
+	}
+	```
+
+Will become:
+
+	```
+	Panel: {
+		DataSource: DataSourceRef
+	}
+
+	DataSourceRef: {
+		Type: string
+		name: string
+	}
+	```
+
+### Usage
+
+```yaml
+name_anonymous_struct:
+  field: string
+  as: string
+```
+
+## `omit`
+
+Omit rewrites schemas to omit the configured objects.
+
+### Usage
+
+```yaml
+omit:
+  objects: []string
+```
+
+## `omit_fields`
+
+OmitFields removes the selected fields from their object definition.
+
+### Usage
+
+```yaml
+omit_fields:
+  fields: []string
+```
+
+## `rename_object`
+
+N/A
+
+### Usage
+
+```yaml
+rename_object:
+  from: string
+  to: string
+```
+
+## `replace_reference`
+
+ReplaceReference replaces any usage of the `From` reference by the one given in `To`.
+
+Example:
+
+	```
+	From = { Package: common, Object: DataSourceRef }
+	To = { Package: common, Object: DataSourceDescriptor }
+	```
+
+	```
+	Panel: {
+		DataSource: common.DataSourceRef
+	}
+	```
+
+Will become:
+
+	```
+	Panel: {
+		DataSource: common.DataSourceDescriptor
+	}
+	```
+
+### Usage
+
+```yaml
+replace_reference:
+  from: string
+  to: string
+```
+
+## `retype_field`
+
+N/A
+
+### Usage
+
+```yaml
+retype_field:
+  field: string
+  as: Type
+  comments: []string
+```
+
+## `retype_object`
+
+N/A
+
+### Usage
+
+```yaml
+retype_object:
+  object: string
+  as: Type
+  comments: []string
+```
+
+## `sanitize_enum_member_names`
+
+SanitizeEnumMemberNames cleans up enum member names that might cause issues
+for language jennies.
+Especially empty member names, or member names starting with a +/- operator.
+
+Example:
+
+	```
+	Position enum('': '', '+1': '+1', '-2': -2)
+	```
+
+Will become:
+
+	```
+	Position enum(None: '', Positive1: '+1', Negative2: '-2')
+	```
+
+### Usage
+
+```yaml
+sanitize_enum_member_names: {}
+```
+
+## `schema_set_entry_point`
+
+N/A
+
+### Usage
+
+```yaml
+schema_set_entry_point:
+  package: string
+  entry_point: string
+```
+
+## `schema_set_identifier`
+
+SchemaSetIdentifier overwrites the Metadata.Identifier field of a schema.
+
+### Usage
+
+```yaml
+schema_set_identifier:
+  package: string
+  identifier: string
+```
+
+## `trim_enum_values`
+
+TrimEnumValues removes leading and trailing spaces from string values.
+It could happen when they add them by mistake in jsonschema/openapi when they define the enums
+
+Example:
+
+	```
+	Position enum('Foo': 'foo', 'Bar': ' bar', 'Baz': 'baz ')
+	```
+
+Will become:
+
+	```
+	Position enum('Foo': 'foo', 'Bar': 'bar', 'Baz': 'baz')
+	```
+
+### Usage
+
+```yaml
+trim_enum_values: {}
+```
+
+## `trim_object_name_prefix`
+
+TrimObjectNamePrefix removes the given prefix from every object's name.
+
+### Usage
+
+```yaml
+trim_object_name_prefix:
+  prefix: string
+```
+
+## `undiscriminated_disjunction_to_any`
+
+UndiscriminatedDisjunctionToAny turns any undiscriminated disjunction into
+the `any` type.
+Disjunctions of scalars are not impacted, disjunctions having a configured
+discriminator field and mapping are not impacted (see DisjunctionInferMapping).
+Note: this pass _should_ run after DisjunctionInferMapping.
+
+### Usage
+
+```yaml
+undiscriminated_disjunction_to_any: {}
+```
+
+## `unspec`
+
+Unspec removes the Kubernetes-style envelope added by kindsys.
+
+Objects named "spec" will be renamed, using the package as new name.
+
+### Usage
+
+```yaml
+unspec: {}
+```
+

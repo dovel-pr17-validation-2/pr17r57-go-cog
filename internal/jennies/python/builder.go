@@ -1,0 +1,137 @@
+package python
+
+import (
+	"path/filepath"
+	"strings"
+
+	"github.com/grafana/codejen"
+	"github.com/grafana/cog/internal/tools"
+	"github.com/grafana/cog/pkg/apiref"
+	"github.com/grafana/cog/pkg/ir"
+	"github.com/grafana/cog/pkg/languages"
+	"github.com/grafana/cog/pkg/template"
+)
+
+type Builder struct {
+	tmpl            *template.Template
+	apiRefCollector *apiref.APIReferenceCollector
+
+	imports          *ModuleImportMap
+	typeFormatter    *typeFormatter
+	rawTypeFormatter *typeFormatter
+	importModule     func(alias string, pkg string, module string) string
+}
+
+func (jenny *Builder) JennyName() string {
+	return "PythonBuilder"
+}
+
+func (jenny *Builder) Generate(context languages.Context) (codejen.Files, error) {
+	files := codejen.Files{}
+	buildersByPackage := make(map[string][]ir.Builder)
+
+	for _, builder := range context.Builders {
+		buildersByPackage[strings.ToLower(builder.Package)] = append(buildersByPackage[strings.ToLower(builder.Package)], builder)
+	}
+
+	for pkg, builders := range buildersByPackage {
+		var source strings.Builder
+
+		jenny.imports = NewImportMap()
+		jenny.importModule = func(alias string, pkg string, module string) string {
+			return jenny.imports.AddModule(alias, pkg, module)
+		}
+		jenny.typeFormatter = builderTypeFormatter(context, func(alias string, pkg string) string {
+			return jenny.imports.AddPackage(alias, pkg)
+		}, jenny.importModule)
+		jenny.rawTypeFormatter = defaultTypeFormatter(context, func(alias string, pkg string) string {
+			return jenny.imports.AddPackage(alias, pkg)
+		}, jenny.importModule)
+
+		for _, builder := range builders {
+			source.WriteString("\n\n")
+
+			output, err := jenny.generateBuilder(context, builder)
+			if err != nil {
+				return nil, err
+			}
+
+			source.Write(output)
+		}
+
+		filename := filepath.Join("builders", pkg+".py")
+		completeSource := jenny.imports.String() + "\n" + source.String()
+
+		files = append(files, *codejen.NewFile(filename, []byte(completeSource), jenny))
+	}
+
+	return files, nil
+}
+
+func (jenny *Builder) generateBuilder(context languages.Context, builder ir.Builder) ([]byte, error) {
+	// every builder uses the following imports
+	jenny.imports.AddPackage("typing", "typing")
+	jenny.importModule("cogbuilder", "..cog", "builder")
+
+	fullObjectName := jenny.typeFormatter.formatRef(builder.For.SelfRef)
+
+	jenny.apiRefCollector.BuilderMethod(builder, apiref.MethodReference{
+		Name: "build",
+		Comments: []string{
+			"Builds the object.",
+		},
+		Return: fullObjectName,
+	})
+
+	for _, factory := range builder.Factories {
+		jenny.apiRefCollector.RegisterFunction(builder.Package, apiref.FunctionReference{
+			Name:     factory.Name,
+			Comments: factory.Comments,
+			Arguments: tools.Map(factory.Args, func(arg ir.Argument) apiref.ArgumentReference {
+				return apiref.ArgumentReference{
+					Name: arg.Name,
+					Type: jenny.typeFormatter.formatType(arg.Type),
+				}
+			}),
+			Return: builder.Name,
+		})
+	}
+
+	return jenny.tmpl.
+		Funcs(template.TypeResolvingHelpers(context)).
+		Funcs(map[string]any{
+			"importModule":            jenny.importModule,
+			"isDisjunctionOfBuilders": context.IsDisjunctionOfBuilders,
+			"formatType":              jenny.typeFormatter.formatType,
+			"formatTypeNotNullable": func(def ir.Type) string {
+				typeDef := def.DeepCopy()
+				typeDef.Nullable = false
+
+				return jenny.typeFormatter.formatType(typeDef)
+			},
+			"formatRawType": jenny.rawTypeFormatter.formatType,
+			"formatRawTypeNotNullable": func(def ir.Type) string {
+				typeDef := def.DeepCopy()
+				typeDef.Nullable = false
+
+				return jenny.rawTypeFormatter.formatType(typeDef)
+			},
+			"formatValue": func(destinationType ir.Type, value any) string {
+				if destinationType.IsRef() {
+					referredObj, found := context.GetObjectByRef(destinationType.AsRef())
+					if found && referredObj.Type.IsEnum() {
+						return jenny.typeFormatter.formatEnumValue(referredObj, value)
+					}
+				}
+
+				return formatValue(value)
+			},
+			"defaultForType": func(typeDef ir.Type) string {
+				return formatValue(defaultValueForType(context.Schemas, typeDef, jenny.importModule, nil))
+			},
+		}).
+		RenderAsBytes("builders/builder.tmpl", map[string]any{
+			"Builder":    builder,
+			"ObjectName": fullObjectName,
+		})
+}

@@ -1,0 +1,124 @@
+package golang
+
+import (
+	"embed"
+	"fmt"
+
+	"github.com/grafana/cog/pkg/apiref"
+	"github.com/grafana/cog/pkg/ir"
+	"github.com/grafana/cog/pkg/languages"
+	"github.com/grafana/cog/pkg/template"
+)
+
+//go:embed templates/runtime/*.tmpl templates/builders/*.tmpl templates/converters/*.tmpl templates/types/*.tmpl
+//nolint:gochecknoglobals
+var templatesFS embed.FS
+
+func initTemplates(config Config, apiRefCollector *apiref.APIReferenceCollector) *template.Template {
+	tmpl, err := template.New(
+		"golang",
+
+		// placeholder functions, will be overridden by jennies
+		template.Funcs(template.TypeResolvingHelpers(languages.Context{})),
+		template.Funcs(template.TypesHelpers(languages.Context{})),
+		template.Funcs(apiref.TemplateHelpers(apiRefCollector)),
+		template.Funcs(formattingTemplateFuncs(config)),
+		template.Funcs(config.OverridesTemplateFuncs),
+		template.Funcs(template.FuncMap{
+			"formatPath": func(_ ir.Path) string {
+				panic("formatPath() needs to be overridden by a jenny")
+			},
+			"formatPathForRange": func(_ ir.Path) string {
+				panic("formatPathForRange() needs to be overridden by a jenny")
+			},
+			"formatType": func(_ ir.Type) string {
+				panic("formatType() needs to be overridden by a jenny")
+			},
+			"formatTypeNoBuilder": func(_ ir.Type) string {
+				panic("formatType() needs to be overridden by a jenny")
+			},
+			"formatRawRef": func(_ ir.Type) string {
+				panic("formatRawRef() needs to be overridden by a jenny")
+			},
+			"importStdPkg": func(_ string) string {
+				panic("importStdPkg() needs to be overridden by a jenny")
+			},
+			"importPkg": func(_ string) string {
+				panic("importPkg() needs to be overridden by a jenny")
+			},
+			"emptyValueForGuard": func(_ ir.Type) string {
+				panic("emptyValueForGuard() needs to be overridden by a jenny")
+			},
+			"typeHasBuilder": func(_ ir.Type) bool {
+				panic("typeHasBuilder() needs to be overridden by a jenny")
+			},
+			"typeHasEqualityFunc": func(_ ir.Type) bool {
+				panic("typeHasEqualityFunc() needs to be overridden by a jenny")
+			},
+			"resolvesToArrayOfScalars": func(typeDef ir.Type) bool {
+				panic("resolvesToArrayOfScalars() needs to be overridden by a jenny")
+			},
+			"resolvesToMapOfScalars": func(typeDef ir.Type) bool {
+				panic("resolvesToMapOfScalars() needs to be overridden by a jenny")
+			},
+			"resolvesToConstraints": func(_ ir.Type) string {
+				panic("resolvesToConstraints() needs to be overridden by a jenny")
+			},
+			"toGoIdent": func(_ string) string {
+				panic("toGoIdent() needs to be overridden by a jenny")
+			},
+			"constructorFor": func(ref *ir.RefType) string {
+				panic("constructorFor() needs to be overridden by a jenny")
+			},
+			"formatValue": func(destinationType ir.Type, value any) string {
+				panic("formatValue() needs to be overridden by a jenny")
+			},
+		}),
+		template.Funcs(template.FuncMap{
+			"maybeAsPointer": func(intoType ir.Type, variableName string) string {
+				if intoType.Nullable && !intoType.IsAnyOf(ir.KindArray, ir.KindMap, ir.KindComposableSlot) {
+					return "&" + variableName
+				}
+
+				return variableName
+			},
+			"maybeDereference": func(typeDef ir.Type) string {
+				if typeDef.Nullable && !typeDef.IsAnyOf(ir.KindArray, ir.KindMap, ir.KindComposableSlot) {
+					return "*"
+				}
+
+				return ""
+			},
+			"isNullableNonArray": func(typeDef ir.Type) bool {
+				return typeDef.Nullable && !typeDef.IsArray()
+			},
+		}),
+		template.ParseFS(templatesFS, "templates"),
+		template.ParseFS(config.OverridesTemplatesFS, "custom"),
+		template.ParseDirectories(config.OverridesTemplatesDirectories...),
+	)
+	if err != nil {
+		panic(fmt.Errorf("could not initialize templates: %w", err))
+	}
+
+	return tmpl
+}
+
+func formattingTemplateFuncs(config Config) template.FuncMap {
+	return template.FuncMap{
+		"formatPackageName":  formatPackageName,
+		"formatObjectName":   formatObjectName,
+		"formatFieldName":    formatFieldName,
+		"formatArgName":      formatArgName,
+		"formatVarName":      formatVarName,
+		"formatFunctionName": formatFunctionName,
+		"formatScalar":       formatScalar,
+		"formatAny": func() string {
+			if config.AnyAsInterface {
+				return "interface{}"
+			}
+
+			return "any"
+		},
+	}
+}

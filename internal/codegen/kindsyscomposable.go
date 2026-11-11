@@ -1,0 +1,80 @@
+package codegen
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"cuelang.org/go/cue"
+	"github.com/grafana/cog/internal/simplecue"
+	"github.com/grafana/cog/pkg/ir"
+)
+
+func kindsysComposableLoader(input CueInput) (ir.Schemas, error) {
+	parsed, libraries, err := input.parseRawCue(context.Background())
+	if err != nil {
+		return nil, err
+	}
+
+	variant, err := schemaVariant(parsed.Value)
+	if err != nil {
+		return nil, err
+	}
+
+	kindIdentifier, err := inferComposableKindIdentifier(parsed.Value)
+	if err != nil {
+		return nil, err
+	}
+
+	var forceNamedEnvelope string
+	if variant == ir.SchemaVariantDataQuery {
+		forceNamedEnvelope = string(variant)
+	}
+
+	schema, err := simplecue.GenerateAST(schemaFromThemaLineage(parsed.Value), simplecue.Config{
+		Package:            input.Package,
+		ForceNamedEnvelope: forceNamedEnvelope,
+		SchemaMetadata: ir.SchemaMeta{
+			Kind:       ir.SchemaKindComposable,
+			Variant:    variant,
+			Identifier: kindIdentifier,
+		},
+		Libraries: libraries,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return input.filterSchema(schema)
+}
+
+func schemaVariant(kindRoot cue.Value) (ir.SchemaVariant, error) {
+	schemaInterface, err := kindRoot.LookupPath(cue.ParsePath("schemaInterface")).String()
+	if err != nil {
+		return "", err
+	}
+
+	switch schemaInterface {
+	case "PanelCfg":
+		return ir.SchemaVariantPanel, nil
+	case "DataQuery":
+		return ir.SchemaVariantDataQuery, nil
+	default:
+		return "", fmt.Errorf("unknown schema variant '%s'", schemaInterface)
+	}
+}
+
+// TODO: the schema should explicitly tell us the "plugin ID"/panel ID/dataquery type/...
+func inferComposableKindIdentifier(kindRoot cue.Value) (string, error) {
+	schemaInterface, err := kindRoot.LookupPath(cue.ParsePath("schemaInterface")).String()
+	if err != nil {
+		return "", err
+	}
+
+	kindName, err := kindRoot.LookupPath(cue.ParsePath("name")).String()
+	if err != nil {
+		return "", err
+	}
+
+	return strings.ToLower(strings.TrimSuffix(kindName, schemaInterface)), nil
+}

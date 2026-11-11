@@ -1,0 +1,43 @@
+package codegen
+
+import (
+	"context"
+
+	"cuelang.org/go/cue"
+	"github.com/grafana/cog/internal/simplecue"
+	"github.com/grafana/cog/pkg/ir"
+)
+
+func kindsysCoreLoader(input CueInput) (ir.Schemas, error) {
+	parsed, libraries, err := input.parseRawCue(context.Background())
+	if err != nil {
+		return nil, err
+	}
+
+	kindIdentifier, err := inferCoreKindIdentifier(parsed.Value)
+	if err != nil {
+		return nil, err
+	}
+
+	schema, err := simplecue.GenerateAST(schemaFromThemaLineage(parsed.Value), simplecue.Config{
+		Package: input.Package,
+		SchemaMetadata: ir.SchemaMeta{
+			Kind:       ir.SchemaKindCore,
+			Identifier: kindIdentifier,
+		},
+		Libraries: libraries,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return input.filterSchema(schema)
+}
+
+func inferCoreKindIdentifier(kindRoot cue.Value) (string, error) {
+	return kindRoot.LookupPath(cue.ParsePath("name")).String()
+}
+
+func schemaFromThemaLineage(kindRoot cue.Value) cue.Value {
+	return kindRoot.LookupPath(cue.ParsePath("lineage.schemas[0].schema"))
+}
