@@ -3,7 +3,7 @@ module github.com/grafana/cog
 go 1.26.0
 
 require (
-	cuelang.org/go v0.11.0
+	cuelang.org/go v0.17.1
 	github.com/fatih/color v1.19.0
 	github.com/getkin/kin-openapi v0.152.0
 	github.com/goccy/go-yaml v1.19.2
@@ -54,5 +54,4 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20261026165753-2ffab32bce7e // indirect
 	google.golang.org/grpc v1.85.0 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
-	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
